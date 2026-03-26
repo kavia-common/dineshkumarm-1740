@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>VoltSurge Demo</title>
+    <title>VoltSurge</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -12,7 +12,7 @@
         <div class="logo">VS</div>
         <div>
           <div class="title">VoltSurge</div>
-          <div class="subtitle">Commercial energy analytics & anomaly alerts (demo)</div>
+          <div class="subtitle">Upload → normalize to kWh → detect anomalies → dashboard</div>
         </div>
       </div>
       <nav class="nav">
@@ -22,28 +22,233 @@
 
     <main class="container">
       <section class="card">
-        <h1>Server is running</h1>
-        <p class="muted">
-          This is the step 01.00 scaffold: FastAPI + static frontend + in-memory session store.
-        </p>
-
-        <div class="grid">
-          <div class="panel">
-            <h2>Session</h2>
-            <pre id="session" class="code">Loading…</pre>
+        <div class="cardHead">
+          <div>
+            <h1>Energy usage dashboard (demo)</h1>
+            <p class="muted">
+              Upload a CSV, select your date/usage columns, normalize to kWh, then view usage + anomaly alerts (≥ 20% above
+              average).
+            </p>
           </div>
-          <div class="panel">
-            <h2>Dataset status</h2>
-            <pre id="status" class="code">Loading…</pre>
+          <div class="cardHeadRight">
+            <div id="connBadge" class="badge badgeNeutral" title="Backend connectivity status">Checking server…</div>
+            <button id="resetBtn" class="btn btnGhost" type="button" title="Clear UI state (server session remains)">
+              Reset UI
+            </button>
+          </div>
+        </div>
+
+        <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+        <div class="steps">
+          <div class="step">
+            <div class="stepNum">1</div>
+            <div class="stepBody">
+              <div class="stepTitle">Upload CSV</div>
+              <div class="stepDesc">We will validate, clean missing values, and remove duplicates.</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="stepNum">2</div>
+            <div class="stepBody">
+              <div class="stepTitle">Configure columns</div>
+              <div class="stepDesc">Pick date column, usage column, unit, and optional region column.</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="stepNum">3</div>
+            <div class="stepBody">
+              <div class="stepTitle">Dashboard</div>
+              <div class="stepDesc">See chart, anomaly points, alerts list, and summary stats.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="gridMain">
+          <!-- LEFT: flow -->
+          <div class="leftCol">
+            <section class="panel">
+              <div class="panelHead">
+                <h2>Step 1 — Upload</h2>
+              </div>
+
+              <form id="uploadForm" class="form" novalidate>
+                <div class="field">
+                  <label for="csvFile">CSV file</label>
+                  <input id="csvFile" name="file" type="file" accept=".csv,text/csv" required />
+                  <div class="help">Supported: .csv (UTF-8)</div>
+                </div>
+
+                <div class="row">
+                  <button id="uploadBtn" class="btn btnPrimary" type="submit">Upload & preview</button>
+                  <button id="loadDemoBtn" class="btn btnSecondary" type="button" title="Creates a demo CSV in memory">
+                    Use demo data
+                  </button>
+                </div>
+              </form>
+
+              <div id="uploadMeta" class="metaGrid hidden"></div>
+
+              <div class="subpanel">
+                <div class="subpanelHead">
+                  <h3>Preview (first rows)</h3>
+                  <div class="subpanelHint">After upload</div>
+                </div>
+                <div class="tableWrap">
+                  <table class="table" aria-label="Preview table">
+                    <thead id="previewThead"></thead>
+                    <tbody id="previewTbody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div id="uploadWarnings" class="warnings hidden"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panelHead">
+                <h2>Step 2 — Configure</h2>
+                <div id="configHint" class="panelHint">Upload a CSV to unlock</div>
+              </div>
+
+              <form id="configForm" class="form" novalidate>
+                <div class="field">
+                  <label for="dateColumn">Date column</label>
+                  <select id="dateColumn" required disabled></select>
+                </div>
+
+                <div class="field">
+                  <label for="usageColumn">Energy usage column</label>
+                  <select id="usageColumn" required disabled></select>
+                </div>
+
+                <div class="row">
+                  <div class="field">
+                    <label for="usageUnit">Usage unit</label>
+                    <select id="usageUnit" required disabled>
+                      <option value="kwh">kWh</option>
+                      <option value="kw">kW</option>
+                      <option value="w">W (treated as Wh; ÷1000 to kWh)</option>
+                    </select>
+                    <div class="help">For demo simplicity, kW assumes a 1-hour interval.</div>
+                  </div>
+
+                  <div class="field">
+                    <label for="regionColumn">Region column (optional)</label>
+                    <select id="regionColumn" disabled>
+                      <option value="">None</option>
+                    </select>
+                    <div class="help">Enables region filter on the dashboard.</div>
+                  </div>
+                </div>
+
+                <div class="row">
+                  <button id="processBtn" class="btn btnPrimary" type="submit" disabled>Process & go to dashboard</button>
+                </div>
+
+                <div id="processMeta" class="metaGrid hidden"></div>
+              </form>
+            </section>
+
+            <section class="panel">
+              <div class="panelHead">
+                <h2>Debug (optional)</h2>
+                <div class="panelHint">Session + dataset status</div>
+              </div>
+              <div class="gridTwo">
+                <div>
+                  <h3 class="miniTitle">Session</h3>
+                  <pre id="sessionPre" class="code">Loading…</pre>
+                </div>
+                <div>
+                  <h3 class="miniTitle">Dataset status</h3>
+                  <pre id="statusPre" class="code">Loading…</pre>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <!-- RIGHT: dashboard -->
+          <div class="rightCol">
+            <section class="panel">
+              <div class="panelHead">
+                <h2>Dashboard</h2>
+                <div class="panelActions">
+                  <div class="field inline">
+                    <label for="regionFilter">Region</label>
+                    <select id="regionFilter" disabled>
+                      <option value="">All</option>
+                    </select>
+                  </div>
+                  <button id="refreshBtn" class="btn btnSecondary" type="button" disabled>Refresh</button>
+                </div>
+              </div>
+
+              <div class="kpis">
+                <div class="kpi">
+                  <div class="kpiLabel">Average (kWh)</div>
+                  <div id="kpiAvg" class="kpiValue">—</div>
+                </div>
+                <div class="kpi">
+                  <div class="kpiLabel">Max (kWh)</div>
+                  <div id="kpiMax" class="kpiValue">—</div>
+                </div>
+                <div class="kpi">
+                  <div class="kpiLabel">Total (kWh)</div>
+                  <div id="kpiTotal" class="kpiValue">—</div>
+                </div>
+                <div class="kpi">
+                  <div class="kpiLabel">Anomalies</div>
+                  <div id="kpiAnoms" class="kpiValue">—</div>
+                </div>
+              </div>
+
+              <div class="chartWrap">
+                <canvas id="usageChart" height="140" aria-label="Energy usage chart"></canvas>
+              </div>
+
+              <div class="split">
+                <div class="subpanel">
+                  <div class="subpanelHead">
+                    <h3>Alerts</h3>
+                    <div id="alertsHint" class="subpanelHint">Values ≥ 20% above average</div>
+                  </div>
+                  <div class="listWrap">
+                    <ul id="alertsList" class="alerts" aria-label="Anomaly alerts list"></ul>
+                    <div id="alertsEmpty" class="emptyState hidden">No anomalies detected for this filter.</div>
+                  </div>
+                </div>
+
+                <div class="subpanel">
+                  <div class="subpanelHead">
+                    <h3>Notes</h3>
+                    <div class="subpanelHint">How anomalies are defined</div>
+                  </div>
+                  <div class="note">
+                    <p>
+                      Baseline average is computed over non-null kWh values. An anomaly is flagged when:
+                      <code>kWh ≥ (1 + threshold) × average</code>.
+                    </p>
+                    <p class="mutedSmall">
+                      Threshold is fixed at <strong>20%</strong> in the dashboard UI (configurable via API query param if
+                      needed).
+                    </p>
+                    <div id="metaSmall" class="metaSmall hidden"></div>
+                  </div>
+                </div>
+              </div>
+            </section>
           </div>
         </div>
 
         <p class="hint">
-          Next steps will add CSV upload, validation/cleaning, kWh normalization, anomaly detection, and charts.
+          Tip: include a <code>region</code> column in your CSV to enable region filtering (e.g. North, South).
         </p>
       </section>
     </main>
 
+    <!-- Chart.js (CDN) -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
