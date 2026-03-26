@@ -1,0 +1,442 @@
+"""
+Voltsurge FastAPI backend.
+
+Provides in-memory CSV upload, cleaning/validation, energy unit normalization to kWh,
+summary statistics, and anomaly detection. No database is used.
+
+Run (locally):
+  uvicorn app.main:app --host 0.0.0.0 --port 3001
+
+Key concepts:
+- Upload returns a session_id.
+- Configure the session with chosen column names (date, usage, optional unit column).
+- Retrieve processed rows, summary stats, and anomalies via REST endpoints.
+"""
+
+from __future__ import annotations
+
+import io
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+
+@dataclass
+class SessionState:
+    """In-memory per-upload session state."""
+
+    raw_df: pd.DataFrame
+    processed_df: Optional[pd.DataFrame] = None
+    config: Optional["ColumnSelectionRequest"] = None
+    stats: Optional["SummaryStatsResponse"] = None
+    anomalies: Optional[List["AnomalyRow"]] = None
+
+
+# In-memory session store (no DB).
+_SESSIONS: Dict[str, SessionState] = {}
+
+openapi_tags = [
+    {"name": "health", "description": "Service health checks."},
+    {"name": "sessions", "description": "Upload CSVs and manage in-memory processing sessions."},
+    {"name": "data", "description": "Retrieve processed data, statistics, and anomalies."},
+]
+
+app = FastAPI(
+    title="Voltsurge Processing API",
+    description=(
+        "In-memory CSV processing APIs for electricity usage analytics: "
+        "validation, cleaning, unit normalization to kWh, summary stats, and anomaly detection."
+    ),
+    version="0.1.0",
+    openapi_tags=openapi_tags,
+)
+
+# Keep CORS permissive for template usage; tighten in production as needed.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class UploadResponse(BaseModel):
+    """Response returned after uploading a CSV."""
+
+    session_id: str = Field(..., description="In-memory session identifier for subsequent API calls.")
+    columns: List[str] = Field(..., description="Detected CSV column names.")
+    preview: List[Dict[str, Any]] = Field(..., description="First few rows (raw) for quick UI preview.")
+
+
+class ColumnSelectionRequest(BaseModel):
+    """User-selected columns and unit configuration for processing."""
+
+    date_column: str = Field(..., description="Column name containing date/time values.")
+    usage_column: str = Field(..., description="Column name containing energy usage values.")
+    unit_column: Optional[str] = Field(
+        None,
+        description="Optional column name containing per-row unit labels (e.g., kWh, Wh, MWh).",
+    )
+    default_unit: Literal["kwh", "wh", "mwh"] = Field(
+        "kwh",
+        description="Default unit to assume when unit_column is not provided or row unit is missing.",
+    )
+    drop_rows_with_missing_date_or_usage: bool = Field(
+        True, description="If true, drop rows missing date or usage after cleaning."
+    )
+
+
+class SummaryStatsResponse(BaseModel):
+    """Summary statistics for normalized usage values."""
+
+    average_kwh: float = Field(..., description="Average usage (kWh) over the processed dataset.")
+    max_kwh: float = Field(..., description="Maximum usage (kWh) over the processed dataset.")
+    total_kwh: float = Field(..., description="Total usage (kWh) over the processed dataset.")
+    row_count: int = Field(..., description="Number of rows after cleaning and normalization.")
+    anomaly_threshold_kwh: float = Field(..., description="Anomaly threshold (>= 1.2 * average_kwh).")
+
+
+class AnomalyRow(BaseModel):
+    """Single anomaly record."""
+
+    row_index: int = Field(..., description="Row index in the processed dataset (0-based).")
+    date: str = Field(..., description="ISO date string for the record.")
+    usage_kwh: float = Field(..., description="Normalized usage value in kWh.")
+    threshold_kwh: float = Field(..., description="Threshold used for anomaly detection.")
+
+
+class ProcessedDataResponse(BaseModel):
+    """Processed dataset response."""
+
+    session_id: str = Field(..., description="Session identifier.")
+    rows: List[Dict[str, Any]] = Field(..., description="Processed rows with normalized usage_kwh.")
+
+
+def _normalize_unit_label(unit: Any) -> Optional[str]:
+    """Normalize unit labels to one of: 'kwh', 'wh', 'mwh'."""
+    if unit is None or (isinstance(unit, float) and np.isnan(unit)):
+        return None
+    s = str(unit).strip().lower().replace(" ", "")
+    if s in {"kwh", "kw-h", "kwhr", "kwhrs", "kilowatthour", "kilowatthours"}:
+        return "kwh"
+    if s in {"wh", "w-h", "whr", "whrs", "watthour", "watthours"}:
+        return "wh"
+    if s in {"mwh", "mw-h", "mwhr", "mwhrs", "megawatthour", "megawatthours"}:
+        return "mwh"
+    return None
+
+
+def _convert_to_kwh(value: float, unit: str) -> float:
+    """Convert a numeric energy value to kWh given its unit."""
+    if unit == "kwh":
+        return float(value)
+    if unit == "wh":
+        return float(value) / 1000.0
+    if unit == "mwh":
+        return float(value) * 1000.0
+    raise ValueError(f"Unsupported unit: {unit}")
+
+
+def _safe_parse_datetime(series: pd.Series) -> pd.Series:
+    """Parse a column to datetime; unparseable values become NaT."""
+    return pd.to_datetime(series, errors="coerce", infer_datetime_format=True, utc=False)
+
+
+def _safe_parse_float(series: pd.Series) -> pd.Series:
+    """Parse a column to float; non-numeric becomes NaN."""
+    return pd.to_numeric(series, errors="coerce").astype("float64")
+
+
+def _clean_and_process(
+    df: pd.DataFrame, config: ColumnSelectionRequest
+) -> Tuple[pd.DataFrame, SummaryStatsResponse, List[AnomalyRow]]:
+    """
+    Clean/validate/process the dataset:
+      - validate required columns
+      - trim column names
+      - parse date and usage
+      - clean missing values (drop invalid by default)
+      - remove duplicates
+      - normalize units -> usage_kwh
+      - compute stats and anomalies (>= 1.2 * average)
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    required = {config.date_column, config.usage_column}
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required columns: {missing}")
+
+    if config.unit_column and config.unit_column not in df.columns:
+        raise HTTPException(status_code=400, detail=f"unit_column '{config.unit_column}' not found in CSV.")
+
+    cols_to_take = [config.date_column, config.usage_column]
+    if config.unit_column:
+        cols_to_take.append(config.unit_column)
+
+    # Rename to internal names for clarity.
+    work = df[cols_to_take].rename(
+        columns={
+            config.date_column: "date",
+            config.usage_column: "usage",
+            config.unit_column: "unit" if config.unit_column else "unit",
+        }
+    )
+
+    # Parse types
+    work["date"] = _safe_parse_datetime(work["date"])
+    work["usage"] = _safe_parse_float(work["usage"])
+
+    if config.unit_column:
+        work["unit"] = work["unit"].apply(_normalize_unit_label)
+    else:
+        work["unit"] = None
+
+    # Fill missing/unknown units with default
+    work["unit"] = work["unit"].fillna(config.default_unit)
+
+    # Drop invalid date/usage by default (simple & predictable)
+    if config.drop_rows_with_missing_date_or_usage:
+        work = work.dropna(subset=["date", "usage"])
+
+    # Remove duplicates after parsing/cleaning
+    work = work.drop_duplicates()
+
+    if work.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="No usable rows after cleaning (check selected columns and data quality).",
+        )
+
+    # Convert to kWh
+    def to_kwh_row(row: pd.Series) -> float:
+        return _convert_to_kwh(float(row["usage"]), str(row["unit"]))
+
+    work["usage_kwh"] = work.apply(to_kwh_row, axis=1)
+
+    # Sort and build ISO string field for response
+    work = work.sort_values("date").reset_index(drop=True)
+    work["date_iso"] = work["date"].dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    avg = float(work["usage_kwh"].mean())
+    maxv = float(work["usage_kwh"].max())
+    total = float(work["usage_kwh"].sum())
+    threshold = avg * 1.2
+
+    stats = SummaryStatsResponse(
+        average_kwh=avg,
+        max_kwh=maxv,
+        total_kwh=total,
+        row_count=int(len(work)),
+        anomaly_threshold_kwh=float(threshold),
+    )
+
+    anomalies: List[AnomalyRow] = []
+    anomaly_rows = work[work["usage_kwh"] >= threshold]
+    for idx, r in anomaly_rows.iterrows():
+        anomalies.append(
+            AnomalyRow(
+                row_index=int(idx),
+                date=str(r["date_iso"]),
+                usage_kwh=float(r["usage_kwh"]),
+                threshold_kwh=float(threshold),
+            )
+        )
+
+    return work, stats, anomalies
+
+
+# PUBLIC_INTERFACE
+@app.get("/health", tags=["health"], summary="Health check", operation_id="health_check")
+def health() -> Dict[str, str]:
+    """Health check endpoint returning service status."""
+    return {"status": "ok"}
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/sessions/upload",
+    tags=["sessions"],
+    summary="Upload a CSV and create an in-memory session",
+    operation_id="upload_csv_create_session",
+)
+async def upload_csv(file: UploadFile = File(...)) -> UploadResponse:
+    """
+    Upload a CSV file.
+
+    Returns:
+      - session_id: use it to configure processing and fetch outputs.
+      - detected columns + a small preview to help users pick columns.
+    """
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a .csv file.")
+
+    try:
+        content = await file.read()
+        text = content.decode("utf-8", errors="replace")
+        df = pd.read_csv(io.StringIO(text))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read CSV: {e}")
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="CSV appears to be empty.")
+
+    session_id = str(uuid.uuid4())
+    _SESSIONS[session_id] = SessionState(raw_df=df)
+
+    return UploadResponse(
+        session_id=session_id,
+        columns=[str(c) for c in df.columns],
+        preview=df.head(10).to_dict(orient="records"),
+    )
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/sessions/{session_id}/configure",
+    tags=["sessions"],
+    summary="Select columns and process the uploaded dataset (clean, normalize, stats, anomalies)",
+    operation_id="configure_and_process_session",
+)
+def configure_session(session_id: str, request: ColumnSelectionRequest) -> SummaryStatsResponse:
+    """
+    Configure a session by selecting the date/usage/unit columns and processing in memory.
+
+    Processing includes:
+    - basic validation (columns exist)
+    - cleaning missing values and removing duplicates
+    - unit normalization to kWh
+    - summary stats and anomaly detection
+    """
+    state = _SESSIONS.get(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+
+    processed_df, stats, anomalies = _clean_and_process(state.raw_df, request)
+
+    state.config = request
+    state.processed_df = processed_df
+    state.stats = stats
+    state.anomalies = anomalies
+    return stats
+
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/sessions/{session_id}/stats",
+    tags=["data"],
+    summary="Get summary statistics for the processed dataset",
+    operation_id="get_session_stats",
+)
+def get_stats(session_id: str) -> SummaryStatsResponse:
+    """Return summary stats for a processed session."""
+    state = _SESSIONS.get(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if not state.stats:
+        raise HTTPException(status_code=400, detail="Session not processed yet. Call /configure first.")
+    return state.stats
+
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/sessions/{session_id}/data",
+    tags=["data"],
+    summary="Get processed rows (normalized usage_kwh)",
+    operation_id="get_processed_data",
+)
+def get_processed_data(session_id: str, limit: int = 5000, offset: int = 0) -> ProcessedDataResponse:
+    """
+    Return processed rows (in-memory) with normalized kWh.
+
+    Query params:
+      - limit: max number of rows to return
+      - offset: starting index
+    """
+    state = _SESSIONS.get(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if state.processed_df is None:
+        raise HTTPException(status_code=400, detail="Session not processed yet. Call /configure first.")
+
+    if offset < 0 or limit < 1:
+        raise HTTPException(status_code=400, detail="offset must be >= 0 and limit must be >= 1.")
+
+    df = state.processed_df
+    sliced = df.iloc[offset : offset + limit]
+
+    rows: List[Dict[str, Any]] = []
+    for _, r in sliced.iterrows():
+        rows.append(
+            {
+                "date": str(r["date_iso"]),
+                "usage_original": float(r["usage"]),
+                "unit": str(r["unit"]),
+                "usage_kwh": float(r["usage_kwh"]),
+            }
+        )
+
+    return ProcessedDataResponse(session_id=session_id, rows=rows)
+
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/sessions/{session_id}/anomalies",
+    tags=["data"],
+    summary="Get anomaly rows (>=20% above average usage)",
+    operation_id="get_anomalies",
+)
+def get_anomalies(session_id: str) -> List[AnomalyRow]:
+    """Return anomaly rows for a processed session."""
+    state = _SESSIONS.get(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if state.anomalies is None:
+        raise HTTPException(status_code=400, detail="Session not processed yet. Call /configure first.")
+    return state.anomalies
+
+
+# PUBLIC_INTERFACE
+@app.delete(
+    "/sessions/{session_id}",
+    tags=["sessions"],
+    summary="Delete an in-memory session",
+    operation_id="delete_session",
+)
+def delete_session(session_id: str) -> Dict[str, str]:
+    """Delete a session and all its in-memory data."""
+    if session_id in _SESSIONS:
+        del _SESSIONS[session_id]
+        return {"status": "deleted"}
+    raise HTTPException(status_code=404, detail="Session not found.")
+
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/docs/usage",
+    tags=["health"],
+    summary="API usage quickstart",
+    operation_id="api_usage_quickstart",
+)
+def api_usage() -> Dict[str, Any]:
+    """Return a small usage guide for the main endpoints."""
+    return {
+        "flow": [
+            "POST /sessions/upload (multipart/form-data file=@your.csv) -> session_id",
+            "POST /sessions/{session_id}/configure (JSON with date_column, usage_column, optional unit_column/default_unit) -> stats",
+            "GET  /sessions/{session_id}/data -> processed rows with usage_kwh",
+            "GET  /sessions/{session_id}/anomalies -> anomaly rows",
+            "GET  /sessions/{session_id}/stats -> stats",
+            "DELETE /sessions/{session_id} -> cleanup",
+        ],
+        "units_supported": ["kwh", "wh", "mwh"],
+        "anomaly_definition": "usage_kwh >= 1.2 * average_kwh",
+    }
