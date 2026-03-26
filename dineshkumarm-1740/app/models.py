@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -57,3 +57,43 @@ class CsvUploadPreviewResponse(BaseModel):
     preview_rows: List[Dict[str, Any]] = Field(..., description="Small preview of cleaned rows (values are strings or null).")
     schema: List[ColumnSchema] = Field(..., description="Per-column schema/profile derived from preview.")
     warnings: List[str] = Field(default_factory=list, description="Non-fatal warnings encountered while parsing/cleaning.")
+
+
+EnergyUnit = Literal["w", "kw", "kwh"]
+
+
+class DatasetSelectColumnsRequest(BaseModel):
+    """Request payload for selecting columns and normalizing usage to kWh."""
+
+    date_column: str = Field(..., description="Normalized name of the column containing date/time values.")
+    usage_column: str = Field(..., description="Normalized name of the column containing numeric energy usage values.")
+    usage_unit: EnergyUnit = Field(..., description="Unit of the usage values: 'w' (Wh assumed per interval), 'kw', or 'kwh'.")
+    region_column: Optional[str] = Field(
+        None,
+        description="Optional normalized column name to treat as region (used later for filtering/slicers).",
+    )
+
+
+class ProcessedDatasetSummary(BaseModel):
+    """Summary metadata about the processed dataset stored in-session."""
+
+    row_count: int = Field(..., description="Number of processed rows stored.")
+    included_null_rows: int = Field(..., description="Rows kept but with missing/invalid kWh values (kwh=null).")
+    dropped_rows: int = Field(..., description="Rows dropped due to missing date or irrecoverable parsing errors.")
+    usage_unit_input: EnergyUnit = Field(..., description="The unit provided by the client for usage values.")
+    usage_unit_normalized: Literal["kwh"] = Field("kwh", description="Normalized unit for stored usage values (always kWh).")
+    date_column: str = Field(..., description="Selected date column name.")
+    usage_column: str = Field(..., description="Selected usage column name.")
+    region_column: Optional[str] = Field(None, description="Selected region column name, if any.")
+    warnings: List[str] = Field(default_factory=list, description="Non-fatal processing warnings (sampled).")
+
+
+class DatasetSelectColumnsResponse(BaseModel):
+    """Response returned after processing selection + normalization."""
+
+    session: SessionInfo
+    summary: ProcessedDatasetSummary
+    preview_rows: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Small preview of processed rows (date_raw, date_iso, kwh, region, usage_raw).",
+    )

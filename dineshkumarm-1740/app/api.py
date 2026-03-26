@@ -5,10 +5,17 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Cookie, File, HTTPException, Response, UploadFile
-from fastapi.responses import JSONResponse
 
 from .csv_utils import parse_and_clean_csv
-from .models import CsvUploadPreviewResponse, DatasetStatusResponse, SessionInfo
+from .models import (
+    CsvUploadPreviewResponse,
+    DatasetSelectColumnsRequest,
+    DatasetSelectColumnsResponse,
+    DatasetStatusResponse,
+    ProcessedDatasetSummary,
+    SessionInfo,
+)
+from .processing import process_dataset_from_preview
 from .session_store import STORE
 
 router = APIRouter(prefix="/api", tags=["api"])
@@ -63,7 +70,7 @@ def get_dataset_status(response: Response, vs_session_id: Optional[str] = Cookie
     payload = (session.payload if session else {}) or {}
     keys = list(payload.keys())
 
-    # Keep preview small and safe; later steps will store larger arrays.
+    # Keep preview small and safe; processed dataset can be large.
     preview = {}
     for k in keys[:5]:
         v = payload.get(k)
@@ -156,6 +163,8 @@ async def upload_dataset_csv(
                 "rows": parsed["preview_rows"],
                 "schema": parsed["schema"],
             },
+            # Clear any previous processed dataset for this session when a new upload happens.
+            "processed": None,
         },
     )
 
@@ -178,4 +187,88 @@ async def upload_dataset_csv(
         preview_rows=parsed["preview_rows"],
         schema=parsed["schema"],
         warnings=parsed["warnings"],
+    )
+
+
+# PUBLIC_INTERFACE
+@router.post(
+    "/dataset/select",
+    summary="Select date/usage/region columns and normalize usage to kWh",
+    description=(
+        "Uses the previously uploaded & cleaned preview rows stored in-session, applies the user's "
+        "column selection (date column, usage column, optional region column) and usage unit, then "
+        "normalizes energy usage values to kWh. The processed dataset is stored in the in-memory "
+        "session payload under `processed`."
+    ),
+    response_model=DatasetSelectColumnsResponse,
+    operation_id="selectDatasetColumnsAndNormalize",
+)
+def select_dataset_columns_and_normalize(
+    request: DatasetSelectColumnsRequest,
+    response: Response,
+    vs_session_id: Optional[str] = Cookie(default=None),
+) -> DatasetSelectColumnsResponse:
+    """
+    Select the dataset columns and normalize energy usage to kWh.
+
+    Requirements implemented (Step 03.00):
+    - API allows selecting date/usage/region columns and unit (w/kw/kwh)
+    - Normalize selected energy values to kWh
+    - Store processed dataset in the in-memory session store
+
+    Returns:
+        DatasetSelectColumnsResponse with summary and a small preview.
+
+    Errors:
+        - 400 if no upload/preview exists, columns are invalid, or processing cannot proceed.
+    """
+    session_id = _ensure_session(response, vs_session_id)
+    session = STORE.get(session_id)
+    payload = (session.payload if session else {}) or {}
+
+    preview = payload.get("preview") or {}
+    preview_rows = preview.get("rows") or []
+    if not isinstance(preview_rows, list) or len(preview_rows) == 0:
+        raise HTTPException(status_code=400, detail="No uploaded dataset preview found. Upload a CSV first.")
+
+    try:
+        result = process_dataset_from_preview(
+            preview_rows=preview_rows,
+            date_column=request.date_column,
+            usage_column=request.usage_column,
+            usage_unit=request.usage_unit,
+            region_column=request.region_column,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to process dataset.") from e
+
+    # Store processed dataset (this is the main Step 03.00 requirement).
+    STORE.patch_payload(
+        session_id,
+        {
+            "selection": {
+                "date_column": request.date_column,
+                "usage_column": request.usage_column,
+                "usage_unit": request.usage_unit,
+                "region_column": request.region_column,
+            },
+            "processed": {
+                "rows": result.processed_rows,
+                "summary": result.summary,
+            },
+        },
+    )
+
+    session = STORE.get(session_id)
+
+    return DatasetSelectColumnsResponse(
+        session=SessionInfo(
+            session_id=session_id,
+            created_at=session.created_at if session else None,
+            updated_at=session.updated_at if session else None,
+        ),
+        summary=ProcessedDatasetSummary(**result.summary),
+        preview_rows=result.preview_rows,
     )
