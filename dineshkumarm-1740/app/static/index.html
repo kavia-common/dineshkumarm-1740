@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VoltSurge Demo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">VS</div>
+        <div>
+          <div class="title">VoltSurge</div>
+          <div class="subtitle">Commercial energy analytics & anomaly alerts (demo)</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <a href="/docs" target="_blank" rel="noreferrer">API Docs</a>
+      </nav>
+    </header>
+
+    <main class="container">
+      <section class="card">
+        <h1>Server is running</h1>
+        <p class="muted">
+          This is the step 01.00 scaffold: FastAPI + static frontend + in-memory session store.
+        </p>
+
+        <div class="grid">
+          <div class="panel">
+            <h2>Session</h2>
+            <pre id="session" class="code">Loading…</pre>
+          </div>
+          <div class="panel">
+            <h2>Dataset status</h2>
+            <pre id="status" class="code">Loading…</pre>
+          </div>
+        </div>
+
+        <p class="hint">
+          Next steps will add CSV upload, validation/cleaning, kWh normalization, anomaly detection, and charts.
+        </p>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
