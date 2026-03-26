@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Cookie, Response
+from fastapi import APIRouter, Cookie, File, HTTPException, Response, UploadFile
 from fastapi.responses import JSONResponse
 
-from .models import DatasetStatusResponse, SessionInfo
+from .csv_utils import parse_and_clean_csv
+from .models import CsvUploadPreviewResponse, DatasetStatusResponse, SessionInfo
 from .session_store import STORE
 
 router = APIRouter(prefix="/api", tags=["api"])
@@ -84,4 +85,97 @@ def get_dataset_status(response: Response, vs_session_id: Optional[str] = Cookie
         has_payload=bool(payload),
         payload_keys=keys,
         payload_preview=preview,
+    )
+
+
+# PUBLIC_INTERFACE
+@router.post(
+    "/dataset/upload",
+    summary="Upload an electricity CSV and return schema + preview",
+    description=(
+        "Accepts a CSV file upload, parses it, performs basic cleaning (trim whitespace, "
+        "convert empty values to null, remove fully-empty rows, remove duplicate rows), "
+        "and returns a schema + preview to support later column selection (date, usage, unit, region). "
+        "Stores the cleaned preview in the in-memory session payload."
+    ),
+    response_model=CsvUploadPreviewResponse,
+    operation_id="uploadDatasetCsv",
+)
+async def upload_dataset_csv(
+    response: Response,
+    file: UploadFile = File(..., description="CSV file containing electricity/energy usage data."),
+    vs_session_id: Optional[str] = Cookie(default=None),
+) -> CsvUploadPreviewResponse:
+    """
+    Upload CSV file and return schema/preview.
+
+    - Basic validation: file extension/type, UTF-8 decode, header presence, at least one data row.
+    - Cleaning: normalize headers, empty->null, drop fully-empty rows, remove duplicates.
+
+    Returns:
+        CsvUploadPreviewResponse containing preview rows and per-column schema profile.
+
+    Notes:
+        This endpoint intentionally does not do unit conversion; later steps handle mapping the
+        selected energy usage column and unit normalization to kWh.
+    """
+    session_id = _ensure_session(response, vs_session_id)
+    session = STORE.get(session_id)
+
+    if file is None:
+        raise HTTPException(status_code=400, detail="Missing file.")
+    if not (file.filename or "").lower().endswith(".csv"):
+        # Still allow unknown extensions if content-type is text/csv-ish, but keep UX strict for demo.
+        content_type = (file.content_type or "").lower()
+        if "csv" not in content_type and "text" not in content_type:
+            raise HTTPException(status_code=400, detail="Only CSV uploads are supported.")
+
+    try:
+        raw = await file.read()
+        parsed = parse_and_clean_csv(raw, filename=file.filename or "upload.csv")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to parse CSV.") from e
+
+    # Store a small, session-scoped payload for later steps.
+    STORE.patch_payload(
+        session_id,
+        {
+            "upload": {
+                "filename": parsed["filename"],
+                "columns_original": parsed["columns_original"],
+                "columns_normalized": parsed["columns_normalized"],
+                "row_count": parsed["row_count"],
+                "row_count_after_cleaning": parsed["row_count_after_cleaning"],
+                "duplicate_rows_removed": parsed["duplicate_rows_removed"],
+                "warnings": parsed["warnings"],
+            },
+            "preview": {
+                "columns": parsed["columns"],
+                "rows": parsed["preview_rows"],
+                "schema": parsed["schema"],
+            },
+        },
+    )
+
+    # Re-read session for updated timestamps
+    session = STORE.get(session_id)
+
+    return CsvUploadPreviewResponse(
+        session=SessionInfo(
+            session_id=session_id,
+            created_at=session.created_at if session else None,
+            updated_at=session.updated_at if session else None,
+        ),
+        filename=parsed["filename"],
+        row_count=parsed["row_count"],
+        row_count_after_cleaning=parsed["row_count_after_cleaning"],
+        duplicate_rows_removed=parsed["duplicate_rows_removed"],
+        columns_original=parsed["columns_original"],
+        columns_normalized=parsed["columns_normalized"],
+        columns=parsed["columns"],
+        preview_rows=parsed["preview_rows"],
+        schema=parsed["schema"],
+        warnings=parsed["warnings"],
     )
