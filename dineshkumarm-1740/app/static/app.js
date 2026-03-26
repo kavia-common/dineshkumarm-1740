@@ -38,19 +38,47 @@ function escapeHtml(s) {
     .replaceAll("'", "&#039;");
 }
 
-async function fetchJson(path, opts = {}) {
-  const res = await fetch(path, {
-    credentials: "include",
-    ...opts,
-  });
-  const text = await res.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = { raw: text };
+const API_BASE = ""; // same-origin deployment; keep empty. (All API paths already start with /api)
+
+function normalizeApiPath(path) {
+  // Allow callers to pass "/api/..." or "api/..." or full URLs; normalize for consistency.
+  if (!path) return path;
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  if (path.startsWith("/")) return `${API_BASE}${path}`;
+  return `${API_BASE}/${path}`;
+}
+
+function describeFetchFailure(err) {
+  const msg = String(err?.message || err || "");
+  // Browser typically throws TypeError: Failed to fetch for network/CORS/mixed content issues.
+  if (msg.toLowerCase().includes("failed to fetch")) {
+    return "Network error: failed to reach backend. If you're running the API on a different origin, ensure CORS is enabled and the server is running.";
   }
-  return { ok: res.ok, status: res.status, json };
+  return `Network error: ${msg || "Unknown error"}`;
+}
+
+async function fetchJson(path, opts = {}) {
+  const url = normalizeApiPath(path);
+
+  try {
+    const res = await fetch(url, {
+      credentials: "include",
+      ...opts,
+    });
+
+    const text = await res.text();
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      json = { raw: text };
+    }
+
+    return { ok: res.ok, status: res.status, json };
+  } catch (err) {
+    // Network/CORS issues never return a response; represent them consistently.
+    return { ok: false, status: 0, json: { detail: describeFetchFailure(err) } };
+  }
 }
 
 async function postJson(path, body) {
@@ -410,6 +438,12 @@ async function refreshDebug() {
   statusPre.textContent = pretty(status.json);
 }
 
+function isMissingProcessedDatasetError(resp) {
+  // Backend uses 400 with this message when processed dataset hasn't been created yet.
+  const detail = String(resp?.json?.detail || "");
+  return resp?.status === 400 && detail.toLowerCase().includes("no processed dataset found");
+}
+
 async function loadDashboard() {
   const refreshBtn = $("refreshBtn");
   setDisabled(refreshBtn, true);
@@ -422,6 +456,13 @@ async function loadDashboard() {
     fetchJson(`/api/anomalies${qs}`),
     fetchJson(`/api/timeseries${qs}`),
   ]);
+
+  // Common case: user hasn't processed selection yet.
+  if (isMissingProcessedDatasetError(summary) || isMissingProcessedDatasetError(anomalies) || isMissingProcessedDatasetError(timeseries)) {
+    showToast("No processed dataset yet. Upload a CSV and run Step 2 (Configure) first.", "error");
+    setDisabled(refreshBtn, false);
+    return;
+  }
 
   if (!summary.ok) {
     showToast(summary.json?.detail || "Failed to load summary metrics.", "error");
@@ -632,7 +673,9 @@ async function main() {
   // Connectivity + session bootstrap
   const health = await fetchJson("/api/health");
   setConnectivityBadge(health.ok);
-  if (!health.ok) showToast("Backend not reachable. Start the server and reload.", "error");
+  if (!health.ok) {
+    showToast(health.json?.detail || "Backend not reachable. Start the server and reload.", "error");
+  }
 
   await refreshDebug();
 
@@ -674,11 +717,12 @@ async function main() {
     showToast("UI reset (server session unchanged).", "info");
   });
 
-  // If the session already has a processed dataset (e.g., after refresh), attempt to enable dashboard quickly.
-  // We won't auto-process without knowing selection, but we can inform user.
+  // If the session already has a processed dataset (e.g., after refresh), enable dashboard quickly.
+  // Use payload_keys rather than trying to infer deep structure from payload_preview.
   const status = await fetchJson("/api/dataset/status");
-  const hasProcessed = !!status.json?.payload_preview?.processed?.rows;
-  if (hasProcessed) {
+  const keys = status.json?.payload_keys || [];
+  const hasProcessedKey = Array.isArray(keys) && keys.includes("processed");
+  if (hasProcessedKey) {
     showToast("Session already has processed data. Click Refresh to load dashboard.", "info");
     setDisabled($("refreshBtn"), false);
   }

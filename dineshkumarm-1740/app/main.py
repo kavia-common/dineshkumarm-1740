@@ -6,15 +6,18 @@ Serves:
 - REST APIs under /api
 
 This is a single-container demo app with an in-memory session store.
+
+Step 06.00 integration notes:
+- Ensure SPA is served at `/` while APIs remain under `/api/*` with no CORS issues.
+- Mount static files last so they never shadow `/api/*`.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Optional
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -37,17 +40,31 @@ def _build_app() -> FastAPI:
 
     app = FastAPI(
         title="VoltSurge Demo API",
-        description="Demo web app for CSV upload, normalization to kWh, anomaly detection, and dashboard metrics. "
-        "This step provides the app skeleton: static UI hosting + in-memory session store.",
+        description="Demo web app for CSV upload, normalization to kWh, anomaly detection, and dashboard metrics.",
         version=APP_VERSION,
         openapi_tags=openapi_tags,
     )
 
-    app.include_router(api_router)
+    # CORS:
+    # In the intended deployment, frontend and backend are same-origin (no CORS needed).
+    # However, allowing common localhost origins makes dev setups resilient (e.g., opening index.html from a different port).
+    # This remains safe for demo because there's no auth and the API is session-cookie based.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://localhost",
+            "http://localhost:8000",
+            "http://127.0.0.1",
+            "http://127.0.0.1:8000",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-    # Static hosting (frontend)
-    # Note: `html=True` allows serving index.html for directory requests.
-    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+    # Include API routes BEFORE mounting the SPA/static files.
+    # This prevents StaticFiles from shadowing /api/* paths.
+    app.include_router(api_router)
 
     # PUBLIC_INTERFACE
     @app.get(
@@ -62,16 +79,26 @@ def _build_app() -> FastAPI:
         """Return a health response."""
         return HealthResponse(status="ok", app=APP_NAME, version=APP_VERSION)
 
+    # Static hosting (frontend) mounted last.
+    # Note: `html=True` allows serving index.html for directory requests.
+    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+
     # SPA fallback: if a route isn't found and it isn't an API path, serve index.html.
-    # This allows frontend routing later if needed.
     @app.exception_handler(404)
     async def not_found_handler(request: Request, exc: Exception):  # type: ignore[override]
         """Serve index.html for unknown non-API routes; otherwise return JSON 404."""
         if request.url.path.startswith("/api"):
             return JSONResponse(status_code=404, content={"detail": "Not Found"})
+
         index_path = STATIC_DIR / "index.html"
         if index_path.exists():
-            return FileResponse(str(index_path))
+            # Avoid caching HTML shell too aggressively; JS/CSS can be cached normally by the browser.
+            return FileResponse(
+                str(index_path),
+                headers={
+                    "Cache-Control": "no-store",
+                },
+            )
         return JSONResponse(status_code=404, content={"detail": "Frontend not built/available"})
 
     return app
