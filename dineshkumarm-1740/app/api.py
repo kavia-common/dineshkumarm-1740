@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Cookie, File, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Cookie, File, HTTPException, Query, Response, UploadFile
 
+from .analytics import build_timeseries_for_chartjs, compute_summary_metrics, detect_anomalies
 from .csv_utils import parse_and_clean_csv
 from .models import (
     CsvUploadPreviewResponse,
@@ -15,6 +16,7 @@ from .models import (
     ProcessedDatasetSummary,
     SessionInfo,
 )
+from .models_step04 import AnomalyDetectionResponse, SummaryMetricsResponse, TimeseriesResponse
 from .processing import process_dataset_from_preview
 from .session_store import STORE
 
@@ -271,4 +273,192 @@ def select_dataset_columns_and_normalize(
         ),
         summary=ProcessedDatasetSummary(**result.summary),
         preview_rows=result.preview_rows,
+    )
+
+
+def _get_processed_rows_or_400(session_id: str) -> list[dict]:
+    """Fetch processed rows from the session payload or raise 400 if missing."""
+    session = STORE.get(session_id)
+    payload = (session.payload if session else {}) or {}
+    processed = payload.get("processed") or {}
+    rows = processed.get("rows") or []
+    if not isinstance(rows, list) or len(rows) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No processed dataset found. Upload CSV and run /api/dataset/select first.",
+        )
+    return rows
+
+
+# PUBLIC_INTERFACE
+@router.get(
+    "/metrics/summary",
+    summary="Compute summary dashboard metrics (avg/max/total kWh)",
+    description=(
+        "Computes summary metrics over the processed in-session dataset. "
+        "Optionally filters by exact-match region (if a region column was selected during processing)."
+    ),
+    response_model=SummaryMetricsResponse,
+    operation_id="getSummaryMetrics",
+)
+def get_summary_metrics(
+    response: Response,
+    vs_session_id: Optional[str] = Cookie(default=None),
+    region: Optional[str] = Query(default=None, description="Optional exact-match region filter."),
+) -> SummaryMetricsResponse:
+    """
+    Compute summary metrics (average, max, total kWh) for the current session's processed dataset.
+
+    Parameters:
+        region: Optional region filter (exact match).
+
+    Returns:
+        SummaryMetricsResponse containing KPI values for the dashboard.
+    """
+    session_id = _ensure_session(response, vs_session_id)
+    rows = _get_processed_rows_or_400(session_id)
+
+    metrics = compute_summary_metrics(rows, region=region)
+
+    session = STORE.get(session_id)
+    return SummaryMetricsResponse(
+        session=SessionInfo(
+            session_id=session_id,
+            created_at=session.created_at if session else None,
+            updated_at=session.updated_at if session else None,
+        ),
+        region=region,
+        row_count_total=metrics.row_count_total,
+        row_count_with_kwh=metrics.row_count_with_kwh,
+        average_kwh=metrics.average_kwh,
+        max_kwh=metrics.max_kwh,
+        total_kwh=metrics.total_kwh,
+    )
+
+
+# PUBLIC_INTERFACE
+@router.get(
+    "/anomalies",
+    summary="Detect anomalies (kWh ≥ 20% above average)",
+    description=(
+        "Detects anomalies in the processed in-session dataset, defined as kWh values that are at least "
+        "20% above the baseline average. Optionally filters by exact-match region."
+    ),
+    response_model=AnomalyDetectionResponse,
+    operation_id="detectAnomalies",
+)
+def get_anomalies(
+    response: Response,
+    vs_session_id: Optional[str] = Cookie(default=None),
+    region: Optional[str] = Query(default=None, description="Optional exact-match region filter."),
+    threshold_ratio: float = Query(
+        default=0.20,
+        ge=0.0,
+        le=10.0,
+        description="Anomaly threshold ratio above baseline average (0.20 = 20%).",
+    ),
+) -> AnomalyDetectionResponse:
+    """
+    Detect anomalies for the current session's processed dataset.
+
+    Parameters:
+        region: Optional region filter (exact match).
+        threshold_ratio: Ratio above average used to flag an anomaly (default 0.20).
+
+    Returns:
+        AnomalyDetectionResponse with baseline average and a sorted list of anomalies.
+    """
+    session_id = _ensure_session(response, vs_session_id)
+    rows = _get_processed_rows_or_400(session_id)
+
+    baseline, anomalies = detect_anomalies(rows, threshold_ratio=threshold_ratio, region=region)
+
+    session = STORE.get(session_id)
+    return AnomalyDetectionResponse(
+        session=SessionInfo(
+            session_id=session_id,
+            created_at=session.created_at if session else None,
+            updated_at=session.updated_at if session else None,
+        ),
+        region=region,
+        threshold_ratio=threshold_ratio,
+        baseline_avg_kwh=float(baseline),
+        anomaly_count=len(anomalies),
+        anomalies=[
+            {
+                "date_iso": a.date_iso,
+                "kwh": a.kwh,
+                "baseline_avg_kwh": a.baseline_avg_kwh,
+                "percent_above_average": a.percent_above_average,
+                "region": a.region,
+            }
+            for a in anomalies
+        ],
+    )
+
+
+# PUBLIC_INTERFACE
+@router.get(
+    "/timeseries",
+    summary="Get Chart.js-friendly energy usage timeseries (with optional anomaly series)",
+    description=(
+        "Returns a Chart.js-friendly object containing labels (date_iso) and datasets. "
+        "Supports optional exact-match region filtering and optional inclusion of an anomaly-only dataset."
+    ),
+    response_model=TimeseriesResponse,
+    operation_id="getTimeseries",
+)
+def get_timeseries(
+    response: Response,
+    vs_session_id: Optional[str] = Cookie(default=None),
+    region: Optional[str] = Query(default=None, description="Optional exact-match region filter."),
+    include_anomalies: bool = Query(default=True, description="Whether to include a second dataset containing only anomalies."),
+    anomaly_threshold_ratio: float = Query(
+        default=0.20,
+        ge=0.0,
+        le=10.0,
+        description="Threshold ratio used to compute anomaly series (0.20 = 20%).",
+    ),
+) -> TimeseriesResponse:
+    """
+    Provide a Chart.js-friendly timeseries payload for the dashboard chart.
+
+    Parameters:
+        region: Optional region filter (exact match).
+        include_anomalies: If true, includes a dataset where only anomalies have non-null points.
+        anomaly_threshold_ratio: Threshold ratio used when computing anomaly series.
+
+    Returns:
+        TimeseriesResponse with labels + datasets.
+    """
+    session_id = _ensure_session(response, vs_session_id)
+    rows = _get_processed_rows_or_400(session_id)
+
+    chart_payload = build_timeseries_for_chartjs(
+        rows,
+        region=region,
+        include_anomaly_series=include_anomalies,
+        anomaly_threshold_ratio=anomaly_threshold_ratio,
+    )
+
+    # Provide some useful meta for the UI without requiring extra requests.
+    baseline, anomalies = detect_anomalies(rows, threshold_ratio=anomaly_threshold_ratio, region=region)
+    meta = {
+        "baseline_avg_kwh": float(baseline) if baseline else 0.0,
+        "anomaly_count": len(anomalies),
+        "threshold_ratio": anomaly_threshold_ratio,
+        "unit": "kwh",
+    }
+
+    session = STORE.get(session_id)
+    return TimeseriesResponse(
+        session=SessionInfo(
+            session_id=session_id,
+            created_at=session.created_at if session else None,
+            updated_at=session.updated_at if session else None,
+        ),
+        region=region,
+        labels=chart_payload.get("labels") or [],
+        datasets=chart_payload.get("datasets") or [],
+        meta=meta,
     )
